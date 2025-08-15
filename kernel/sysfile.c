@@ -503,3 +503,117 @@ sys_pipe(void)
   }
   return 0;
 }
+
+uint64 sys_mmap(void) {
+  void *addr;
+  uint64 length;
+  int prot;  // PROT_READ or PROT_WRITE or both
+  int flags; // shared or private
+  int fd;
+  struct file *file;
+  uint64 offset;
+  argaddr(0, (void *)&addr); // ignored
+  argint64(1, &length);
+  argint(2, &prot);
+  argint(3, &flags);
+  argfd(4, &fd, &file);
+  argint64(5, &offset); // ignored
+  if (file->readable == 0 && (prot & PROT_READ)) {
+    printf("mmap: invalid read operation\n");
+    return -1;
+  }
+  if (file->writable == 0 && (prot & PROT_WRITE) && (flags & MAP_SHARED)) {
+    printf("mmap: invalid write operation\n");
+    return -1;
+  }
+  struct proc *p = myproc();
+  for (int i = 0; i < NVMA; ++i) {
+    if (p->vmas[i].used)
+      continue;
+    addr = (void *)PGROUNDDOWN(p->mmap_top - length);
+    p->vmas[i].used = 1;
+    p->vmas[i].addr = addr;
+    p->vmas[i].length = length;
+    p->vmas[i].prot = prot;
+    p->vmas[i].flags = flags;
+    p->vmas[i].fd = fd;
+    p->vmas[i].file = file;
+    p->vmas[i].offset = offset;
+    p->mmap_top = (uint64)addr;
+    filedup(file);
+    return (uint64)addr;
+  }
+  return -1;
+}
+
+uint64 sys_munmap(void) {
+  void *addr;
+  uint64 length;
+  argaddr(0, (void *)&addr);
+  argint64(1, &length);
+  uint64 begin = PGROUNDDOWN((uint64)addr);
+  uint64 end = PGROUNDUP((uint64)addr + length);
+  struct proc *p = myproc();
+  struct vma *vma = 0;
+  for (int i = 0; i < NVMA; ++i) {
+    if (p->vmas[i].used == 0)
+      continue;
+    uint64 vma_end = PGROUNDUP((uint64)p->vmas[i].addr + p->vmas[i].length);
+    if (begin >= (uint64)p->vmas[i].addr && end <= vma_end) {
+      vma = &p->vmas[i];
+      break;
+    }
+  }
+  if (vma == 0) {
+    printf("munmap: invalid range %p, %p\n", begin, end);
+    return -1;
+  }
+  struct file *file = vma->file;
+  if (vma->flags & MAP_SHARED) {
+    if (file->writable == 0) {
+      printf("munmap: the file is unwritable\n");
+      return -1;
+    }
+    for (uint n = 0; n < end - begin; n += PGSIZE) {
+      pte_t *pte = walk(p->pagetable, begin + n, 0);
+      if (pte == 0)
+        panic("munmap: walk");
+      if ((*pte & PTE_V) == 0)
+        continue;
+      begin_op();
+      ilock(file->ip);
+      // writei call iupdate
+      if (writei(file->ip, 1, begin + n,
+                 begin + n - (uint64)vma->addr + vma->offset,
+                 PGSIZE) != PGSIZE) {
+        iunlockput(file->ip);
+        end_op();
+        return -1;
+      }
+      iunlockput(file->ip);
+      end_op();
+    }
+  }
+  for (uint64 i = begin; i < end; i += PGSIZE) {
+    pte_t *pte = walk(p->pagetable, i, 0);
+    if (pte == 0)
+      panic("munmap: walk");
+    if ((*pte & PTE_V) == 0)
+      continue;
+    uvmunmap(p->pagetable, i, 1, 1);
+  }
+  uint64 vma_end = PGROUNDUP((uint64)vma->addr + vma->length);
+  if (begin == (uint64)vma->addr && end == vma_end) {
+    vma->used = 0;
+    filered(file);
+  } else if (begin == (uint64)vma->addr && end < vma_end) {
+    vma->addr = (void *)end;
+    vma->length -= end - begin;
+    vma->offset += end - begin;
+  } else if (begin > (uint64)vma->addr && end == vma_end) {
+    vma->length = begin - (uint64)vma->addr;
+  } else {
+    panic("munmap: range not supported");
+  }
+  return 0;
+}
